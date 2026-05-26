@@ -40,7 +40,7 @@ Start-Transcript -Path $logPath -Force
 $Host.UI.RawUI.WindowTitle = "Tiny10 Master Builder"
 Clear-Host
 Write-Host "====================================================" -ForegroundColor Green
-Write-Host "        Tiny10 Master Builder & Optimizer           " -ForegroundColor Green
+Write-Host "                  Tiny10 Builder                    " -ForegroundColor Green
 Write-Host "====================================================" -ForegroundColor Green
 
 # 5. User Preferences Prompt
