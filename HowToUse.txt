@@ -1,0 +1,67 @@
+How To Use:
+
+1. Download Tiny10 Builder
+Download the latest Tiny10 Builder .zip from GitHub
+
+After downloading:
+
+Extract the ZIP file
+Move the extracted folder to: C:\Tiny10-Builder
+
+
+
+2. Disable Real-Time Protection (Optional but Recommended)
+Some antivirus software may falsely detect PowerShell image servicing operations.
+
+You can temporarily disable:
+
+Windows Security ? Virus & threat protection ? Real-time protection
+
+This step is optional but recommended.
+
+
+
+3. Open PowerShell as Administrator
+Right-click PowerShell and select: Run as Administrator
+
+
+
+4. Enable PowerShell Script Execution
+Type: Set-ExecutionPolicy -ExecutionPolicy Unrestricted
+
+Press Enter.
+
+If PowerShell asks for confirmation:
+
+Type: A
+
+
+
+5. Navigate to Tiny10 Builder Folder
+Example: cd C:\Tiny10-Builder
+
+
+
+6. Run Tiny10 Builder
+Example: .\Tiny10_Builder_V2.ps1
+
+
+
+7. Follow the Builder Instructions
+The builder will:
+
+Detect the Windows image
+Ask for image index selection
+Ask optional removal settings
+Build and optimize the ISO automatically
+
+After completion, the generated Tiny10 ISO will appear inside the selected workspace location.
+
+
+
+Important Notes
+Only official Microsoft Windows 10 ISOs are supported
+LTSC and IoT LTSC are supported
+Administrator privileges are required
+Experimental versions may be unstable
+Always test generated ISOs in a virtual machine before installing on real hardware
