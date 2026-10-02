@@ -7,13 +7,16 @@
 .DESCRIPTION
     Fixed version:
       - Does not download the old/broken autounattend.xml.
-      - Generates a clean answer file with OOBE user creation enabled.
+      - Generates a clean answer file.
       - Dynamically selects the install.wim/install.esd index.
       - Dynamically selects the boot.wim index.
       - Does not hardcode boot.wim index 2.
       - Does not hardcode the exported install image index.
       - Validates image indexes before mounting/exporting.
       - Supports customized single-index WIM/ESD sources.
+      - Removes an expanded list of unwanted provisioned Appx packages.
+      - Uses registry helper functions that work correctly with PowerShell 5.1.
+      - Preserves command-line parameters when elevation is required.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -46,14 +49,22 @@ $DriveLetter    = $null
 $removeEdge     = $false
 $removeOneDrive = $false
 $osEdition      = 'Unknown'
+$architecture   = $null
+$bootIndex      = $null
+$finalInstallIndex = $null
 
 # ── Security Principal ─────────────────────────────────────────────────────────
-$adminSID   = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+$adminSID = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
 $adminGroup = $adminSID.Translate([System.Security.Principal.NTAccount])
 
 # ── Helper Functions ───────────────────────────────────────────────────────────
 $script:stepTotal   = 18
 $script:stepCurrent = 0
+$script:installWimMounted = $false
+$script:bootWimMounted    = $false
+$script:removedPackages   = [System.Collections.Generic.List[string]]::new()
+$script:buildSuccess      = $false
+$script:transcriptStarted = $false
 
 function Write-Log {
     param(
@@ -85,10 +96,18 @@ function Write-Step {
 }
 
 function Set-RegistryValue {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
+        [Parameter(Mandatory = $true)]
         [string]$Path,
+
+        [Parameter(Mandatory = $true)]
         [string]$Name,
+
+        [Parameter(Mandatory = $true)]
         [string]$Type,
+
+        [Parameter(Mandatory = $true)]
         [string]$Value
     )
 
@@ -97,17 +116,21 @@ function Set-RegistryValue {
             & reg.exe add $Path /v $Name /t $Type /d $Value /f | Out-Null
 
             if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Registry set returned exit code $LASTEXITCODE: $Path\$Name"
+                Write-Warning `
+                    "Registry set returned exit code $LASTEXITCODE: $Path\$Name"
             }
         }
         catch {
-            Write-Warning "Registry set failed: $Path\$Name — $_"
+            Write-Warning `
+                "Registry set failed: $Path\$Name — $_"
         }
     }
 }
 
 function Remove-RegistryValue {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
+        [Parameter(Mandatory = $true)]
         [string]$Path
     )
 
@@ -116,11 +139,13 @@ function Remove-RegistryValue {
             & reg.exe delete $Path /f | Out-Null
 
             if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Registry delete returned exit code $LASTEXITCODE: $Path"
+                Write-Warning `
+                    "Registry delete returned exit code $LASTEXITCODE: $Path"
             }
         }
         catch {
-            Write-Warning "Registry delete failed: $Path — $_"
+            Write-Warning `
+                "Registry delete failed: $Path — $_"
         }
     }
 }
@@ -134,7 +159,9 @@ function Read-YesNo {
         $a = (Read-Host $Prompt).Trim().ToLower()
 
         if ($a -notin 'yes','y','no','n') {
-            Write-Host 'Please enter yes/no (or y/n).' -ForegroundColor Red
+            Write-Host `
+                'Please enter yes/no (or y/n).' `
+                -ForegroundColor Red
         }
 
     } while ($a -notin 'yes','y','no','n')
@@ -150,19 +177,25 @@ function Assert-FreeSpace {
 
     $letter = $Drive.TrimEnd(':')[0]
 
-    $vol = Get-PSDrive -Name $letter -ErrorAction SilentlyContinue
+    $vol = Get-PSDrive `
+        -Name $letter `
+        -ErrorAction SilentlyContinue
 
     if ($vol) {
         $freeGB = [math]::Round($vol.Free / 1GB, 1)
 
         if ($vol.Free -lt ($RequiredGB * 1GB)) {
-            throw "Insufficient disk space on ${Drive}. Need ${RequiredGB} GB, have ${freeGB} GB."
+            throw `
+                "Insufficient disk space on ${Drive}. Need ${RequiredGB} GB, have ${freeGB} GB."
         }
 
-        Write-Log "Disk space OK: ${freeGB} GB free on ${Drive}." -Color Gray
+        Write-Log `
+            "Disk space OK: ${freeGB} GB free on ${Drive}." `
+            -Color Gray
     }
     else {
-        Write-Warning "Could not check disk space on ${Drive} — continuing anyway."
+        Write-Warning `
+            "Could not check disk space on ${Drive} — continuing anyway."
     }
 }
 
@@ -172,17 +205,42 @@ function Unload-AllHives {
     }
 }
 
-function Dismount-AllStaleMounts {
-    $allMounted = Get-WindowsImage -Mounted -ErrorAction SilentlyContinue
+function Load-RegistryHive {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$HiveName,
 
-    if ($allMounted) {
-        foreach ($mount in $allMounted) {
-            Write-Log "Dismounting stale WIM at: $($mount.Path)" -Color Yellow
+        [Parameter(Mandatory = $true)]
+        [string]$HiveFile
+    )
 
-            Dismount-WindowsImage `
-                -Path $mount.Path `
-                -Discard `
-                -ErrorAction SilentlyContinue
+    if (-not (Test-Path $HiveFile)) {
+        throw "Registry hive file was not found: $HiveFile"
+    }
+
+    & reg.exe load "HKLM\$HiveName" "$HiveFile" | Out-Null
+
+    if ($LASTEXITCODE -ne 0) {
+        throw `
+            "Failed to load registry hive HKLM\$HiveName from $HiveFile. Exit code: $LASTEXITCODE"
+    }
+}
+
+function Dismount-ScratchMount {
+    $mounted = Get-WindowsImage -Mounted -ErrorAction SilentlyContinue
+
+    if ($mounted) {
+        foreach ($mount in @($mounted)) {
+            if ($mount.Path -eq $scratchDir) {
+                Write-Log `
+                    "Dismounting existing Tiny10 mount at: $($mount.Path)" `
+                    -Color Yellow
+
+                Dismount-WindowsImage `
+                    -Path $mount.Path `
+                    -Discard `
+                    -ErrorAction SilentlyContinue
+            }
         }
     }
 }
@@ -202,7 +260,10 @@ function Select-ImageIndex {
         throw "No Windows images were found in: $ImagePath"
     }
 
-    Write-Log "Available images in $ImagePath:" -Color Gray
+    Write-Log `
+        "Available images in $ImagePath:" `
+        -Color Gray
+
     $images |
         Format-Table `
             ImageIndex,
@@ -210,6 +271,17 @@ function Select-ImageIndex {
             Architecture,
             ImageDescription `
             -AutoSize
+
+    # If there is exactly one image, automatically use it.
+    if ($images.Count -eq 1) {
+        $onlyIndex = [int]$images[0].ImageIndex
+
+        Write-Log `
+            "Only one image is present. Automatically selecting index $onlyIndex." `
+            -Color Green
+
+        return $onlyIndex
+    }
 
     do {
         $inputIndex = Read-Host $Prompt
@@ -223,9 +295,10 @@ function Select-ImageIndex {
             continue
         }
 
-        $match = $images | Where-Object {
-            $_.ImageIndex -eq $selectedIndex
-        }
+        $match = $images |
+            Where-Object {
+                [int]$_.ImageIndex -eq $selectedIndex
+            }
 
         if (-not $match) {
             Write-Host `
@@ -237,7 +310,9 @@ function Select-ImageIndex {
 
     } while ($selectedIndex -eq 0)
 
-    Write-Log "Selected image index: $selectedIndex" -Color Green
+    Write-Log `
+        "Selected image index: $selectedIndex" `
+        -Color Green
 
     return [int]$selectedIndex
 }
@@ -255,7 +330,13 @@ function Write-FixedAutounattend {
     )
 
     if ($Architecture -notin 'x86','amd64') {
-        throw "Unsupported architecture for answer file: $Architecture"
+        throw `
+            "Unsupported architecture for answer file: $Architecture"
+    }
+
+    if ($InstallIndex -lt 1) {
+        throw `
+            "Invalid install image index for answer file: $InstallIndex"
     }
 
     $xml = @"
@@ -333,7 +414,9 @@ function Write-FixedAutounattend {
         -Encoding UTF8 `
         -Force
 
-    Write-Log "Generated fixed autounattend.xml." -Color Gray
+    Write-Log `
+        'Generated fixed autounattend.xml.' `
+        -Color Gray
 }
 
 # ── Execution Policy & Elevation ───────────────────────────────────────────────
@@ -360,20 +443,51 @@ if (-not $principal.IsInRole(
         'Re-launching as Administrator...' `
         -ForegroundColor Cyan
 
-    $p = New-Object System.Diagnostics.ProcessStartInfo 'PowerShell'
+    $p = New-Object System.Diagnostics.ProcessStartInfo
 
-    $p.Arguments = `
-        "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    $p.FileName = 'powershell.exe'
 
+    $argumentList = @(
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        "`"$PSCommandPath`""
+    )
+
+    if ($PSBoundParameters.ContainsKey('ISO') -and $ISO) {
+        $argumentList += '-ISO'
+        $argumentList += "`"$ISO`""
+    }
+
+    if ($PSBoundParameters.ContainsKey('SCRATCH') -and $SCRATCH) {
+        $argumentList += '-SCRATCH'
+        $argumentList += "`"$SCRATCH`""
+    }
+
+    if ($KeepEdge) {
+        $argumentList += '-KeepEdge'
+    }
+
+    if ($KeepOneDrive) {
+        $argumentList += '-KeepOneDrive'
+    }
+
+    if ($SkipCleanup) {
+        $argumentList += '-SkipCleanup'
+    }
+
+    $p.Arguments = $argumentList -join ' '
     $p.Verb = 'runas'
 
-    [System.Diagnostics.Process]::Start($p)
+    [System.Diagnostics.Process]::Start($p) | Out-Null
 
     exit
 }
 
 # ── Transcript ─────────────────────────────────────────────────────────────────
 Start-Transcript -Path $logPath -Force
+$script:transcriptStarted = $true
 
 $Host.UI.RawUI.WindowTitle = 'Tiny10 Builder'
 
@@ -382,12 +496,6 @@ Clear-Host
 Write-Host '════════════════════════════════════════════' -ForegroundColor Green
 Write-Host '           Tiny10 Builder Optimized         ' -ForegroundColor Green
 Write-Host '════════════════════════════════════════════' -ForegroundColor Green
-
-$script:installWimMounted = $false
-$script:bootWimMounted    = $false
-$script:hivesLoaded       = $false
-$script:removedPackages   = [System.Collections.Generic.List[string]]::new()
-$script:buildSuccess      = $false
 
 try {
 
@@ -430,32 +538,39 @@ try {
             $DriveLetter = $ISO
         }
 
-        $DriveLetter =
-            $DriveLetter.
-                Trim().
-                TrimEnd(':').
-                TrimEnd('\').
-                Trim()
+        $DriveLetter = `
+            $DriveLetter.Trim().TrimEnd(':').TrimEnd('\').Trim()
 
         if ($DriveLetter -match '^[c-zC-Z]$') {
             $DriveLetter += ':'
         }
         else {
-            Write-Host 'Invalid entry.' -ForegroundColor Red
+            Write-Host `
+                'Invalid entry.' `
+                -ForegroundColor Red
+
             $ISO = $null
         }
 
     } while ($DriveLetter -notmatch '^[c-zC-Z]:$')
 
+    if (-not (Test-Path $DriveLetter)) {
+        throw "Drive $DriveLetter could not be accessed."
+    }
+
     $installWim = Join-Path $DriveLetter 'sources\install.wim'
     $installEsd = Join-Path $DriveLetter 'sources\install.esd'
-    $targetWim  = Join-Path $workspaceDir 'sources\install.wim'
+
+    $targetWim = Join-Path `
+        $workspaceDir `
+        'sources\install.wim'
 
     if (
         -not (Test-Path $installWim) -and
         -not (Test-Path $installEsd)
     ) {
-        throw "Cannot find install.wim or install.esd on $DriveLetter"
+        throw `
+            "Cannot find install.wim or install.esd on $DriveLetter"
     }
 
     $srcPath =
@@ -466,7 +581,9 @@ try {
             $installEsd
         }
 
-    Write-Log "Source image: $srcPath" -Color Gray
+    Write-Log `
+        "Source image: $srcPath" `
+        -Color Gray
 
     # ── Step 4: Disk Space Check ───────────────────────────────────────────────
     Write-Step 'Checking available disk space'
@@ -475,7 +592,7 @@ try {
         -Drive $ScratchDisk `
         -RequiredGB 25
 
-    # ── Step 5: Workspace Initialization ──────────────────────────────────────
+    # ── Step 5: Workspace Initialization ───────────────────────────────────────
     Write-Step 'Initializing build workspace'
 
     foreach ($dir in $workspaceDir, $scratchDir) {
@@ -501,7 +618,7 @@ try {
         -Path $scratchDir |
         Out-Null
 
-    # ── Step 6: Copy Source Files ──────────────────────────────────────────────
+    # ── Step 6: Copy ISO Source Structure ──────────────────────────────────────
     Write-Step 'Copying ISO source structure'
 
     Get-ChildItem `
@@ -518,8 +635,13 @@ try {
                     Substring($DriveLetter.Length).
                     TrimStart('\')
 
-            $dest = Join-Path $workspaceDir $relative
-            $destDir = Split-Path $dest -Parent
+            $dest = Join-Path `
+                $workspaceDir `
+                $relative
+
+            $destDir = Split-Path `
+                $dest `
+                -Parent
 
             if (-not (Test-Path $destDir)) {
                 New-Item `
@@ -536,12 +658,23 @@ try {
                 -ErrorAction SilentlyContinue
         }
 
+    # Verify critical source files.
+    $bootWimPath = Join-Path `
+        $workspaceDir `
+        'sources\boot.wim'
+
+    if (-not (Test-Path $bootWimPath)) {
+        throw `
+            "boot.wim was not copied to the workspace."
+    }
+
     # ── Step 7: Image Extraction ───────────────────────────────────────────────
     Write-Step 'Selecting and extracting Windows image'
 
-    $sourceIndex = Select-ImageIndex `
-        -ImagePath $srcPath `
-        -Prompt 'Select the install image index to build'
+    $sourceIndex =
+        Select-ImageIndex `
+            -ImagePath $srcPath `
+            -Prompt 'Select the install image index to build'
 
     Export-WindowsImage `
         -SourceImagePath $srcPath `
@@ -550,11 +683,24 @@ try {
         -CompressionType Maximum `
         -ErrorAction Stop
 
+    if (-not (Test-Path $targetWim)) {
+        throw `
+            'DISM reported success, but the exported target WIM was not created.'
+    }
+
     # ── Step 8: Mount Install Image ────────────────────────────────────────────
     Write-Step 'Mounting Windows image'
 
-    & takeown.exe "/F" $targetWim | Out-Null
-    & icacls.exe $targetWim "/grant" "$($adminGroup.Value):(F)" | Out-Null
+    & takeown.exe `
+        "/F" `
+        $targetWim |
+        Out-Null
+
+    & icacls.exe `
+        $targetWim `
+        "/grant" `
+        "$($adminGroup.Value):(F)" |
+        Out-Null
 
     Set-ItemProperty `
         -Path $targetWim `
@@ -562,20 +708,25 @@ try {
         -Value $false `
         -ErrorAction SilentlyContinue
 
-    Dismount-AllStaleMounts
+    Dismount-ScratchMount
 
-    # Do not assume the exported WIM index.
-    $targetImages = @(Get-WindowsImage -ImagePath $targetWim)
+    $targetImages =
+        @(Get-WindowsImage `
+            -ImagePath $targetWim `
+            -ErrorAction Stop)
 
     if ($targetImages.Count -eq 0) {
-        throw "No image was found in the exported target WIM."
+        throw `
+            'No image was found in the exported target WIM.'
     }
 
     if ($targetImages.Count -ne 1) {
-        throw "Expected exactly one image in the exported target WIM, found $($targetImages.Count)."
+        throw `
+            "Expected exactly one image in the exported target WIM, found $($targetImages.Count)."
     }
 
-    $targetIndex = [int]$targetImages[0].ImageIndex
+    $targetIndex =
+        [int]$targetImages[0].ImageIndex
 
     Write-Log `
         "Exported target WIM index: $targetIndex" `
@@ -592,20 +743,34 @@ try {
     $wimInfo =
         Get-WindowsImage `
             -ImagePath $targetWim `
-            -Index $targetIndex
+            -Index $targetIndex `
+            -ErrorAction Stop
 
-    $architecture =
-        if ($wimInfo.Architecture -eq 0) {
-            'x86'
+    switch ([int]$wimInfo.Architecture) {
+
+        0 {
+            $architecture = 'x86'
         }
-        else {
-            'amd64'
+
+        9 {
+            $architecture = 'amd64'
         }
+
+        default {
+            throw `
+                "Unsupported Windows image architecture value: $($wimInfo.Architecture)"
+        }
+    }
 
     $osEdition = $wimInfo.ImageName
 
-    Write-Log "Selected edition: $osEdition" -Color Gray
-    Write-Log "Architecture: $architecture" -Color Gray
+    Write-Log `
+        "Selected edition: $osEdition" `
+        -Color Gray
+
+    Write-Log `
+        "Architecture: $architecture" `
+        -Color Gray
 
     # ── Step 9: Bloatware Package Removal ─────────────────────────────────────
     Write-Step 'Removing bloatware packages'
@@ -615,68 +780,128 @@ try {
             "/image:$scratchDir" `
             '/Get-ProvisionedAppxPackages' |
             ForEach-Object {
+
                 if ($_ -match 'PackageName : (.*)') {
-                    $matches[1]
+                    $matches[1].Trim()
                 }
             }
 
+    # Complete package-family list supplied for Tiny10.
     $packagePrefixes = @(
+        'AppUp.IntelManagementandSecurityStatus',
+        'Clipchamp.Clipchamp',
+        'DolbyLaboratories.DolbyAccess',
+        'DolbyLaboratories.DolbyDigitalPlusDecoderOEM',
         'Microsoft.BingNews',
+        'Microsoft.BingSearch',
         'Microsoft.BingWeather',
+        'Microsoft.Copilot',
+        'Microsoft.Windows.CrossDevice',
+        'Microsoft.GamingApp',
         'Microsoft.GetHelp',
         'Microsoft.Getstarted',
+        'Microsoft.Microsoft3DViewer',
         'Microsoft.MicrosoftOfficeHub',
         'Microsoft.MicrosoftSolitaireCollection',
+        'Microsoft.MicrosoftStickyNotes',
+        'Microsoft.MixedReality.Portal',
+        'Microsoft.MSPaint',
+        'Microsoft.Office.OneNote',
+        'Microsoft.OfficePushNotificationUtility',
+        'Microsoft.OutlookForWindows',
+        'Microsoft.Paint',
         'Microsoft.People',
+        'Microsoft.PowerAutomateDesktop',
+        'Microsoft.SkypeApp',
+        'Microsoft.StartExperiencesApp',
+        'Microsoft.Todos',
+        'Microsoft.Wallet',
+        'Microsoft.Windows.DevHome',
+        'Microsoft.Windows.Copilot',
+        'Microsoft.Windows.Teams',
+        'Microsoft.WindowsAlarms',
+        'Microsoft.WindowsCamera',
+        'microsoft.windowscommunicationsapps',
         'Microsoft.WindowsFeedbackHub',
         'Microsoft.WindowsMaps',
         'Microsoft.WindowsSoundRecorder',
+        'Microsoft.WindowsTerminal',
+        'Microsoft.Xbox.TCUI',
+        'Microsoft.XboxApp',
+        'Microsoft.XboxGameOverlay',
+        'Microsoft.XboxGamingOverlay',
+        'Microsoft.XboxIdentityProvider',
+        'Microsoft.XboxSpeechToTextOverlay',
         'Microsoft.YourPhone',
         'Microsoft.ZuneMusic',
         'Microsoft.ZuneVideo',
-        'microsoft.windowscommunicationsapps',
-        'Clipchamp.Clipchamp',
-        'Microsoft.Copilot',
-        'Microsoft.Windows.Copilot',
-        'Microsoft.OutlookForWindows',
-        'Microsoft.PowerAutomateDesktop',
-        'Microsoft.Wallet',
-        'Microsoft.Windows.Teams',
+        'MicrosoftCorporationII.MicrosoftFamily',
+        'MicrosoftCorporationII.QuickAssist',
         'MSTeams',
-        'Cortana',
-        'Microsoft.549981C3F5F10',
-        'GamingApp',
-        'Xbox'
+        'MicrosoftTeams',
+        'Microsoft.549981C3F5F10'
     )
 
-    foreach (
-        $pkg in (
-            $packages |
-            Where-Object {
-                $p = $_
+    if (-not $packages) {
+        Write-Log `
+            'No provisioned Appx packages were returned by DISM.' `
+            -Color Yellow
+    }
+    else {
 
-                $packagePrefixes |
-                Where-Object {
-                    $p -like "*$_*"
+        foreach ($pkg in @($packages)) {
+
+            # Example:
+            # Microsoft.BingWeather_4.53.12345.0_neutral__8wekyb3d8bbwe
+            #
+            # Everything before the first underscore is the package family.
+            $packageFamily =
+                ($pkg -split '_', 2)[0]
+
+            $shouldRemove = $false
+
+            foreach ($prefix in $packagePrefixes) {
+
+                if (
+                    $packageFamily -ieq $prefix -or
+                    $packageFamily -like "$prefix*"
+                ) {
+                    $shouldRemove = $true
+                    break
                 }
             }
-        )
-    ) {
 
-        Write-Log `
-            "Removing provisioned package: $pkg" `
-            -Color DarkYellow
+            if ($shouldRemove) {
 
-        & dism.exe `
-            "/image:$scratchDir" `
-            '/Remove-ProvisionedAppxPackage' `
-            "/PackageName:$pkg" |
-            Out-Null
+                Write-Log `
+                    "Removing provisioned package: $pkg" `
+                    -Color DarkYellow
 
-        $script:removedPackages.Add($pkg)
+                & dism.exe `
+                    "/image:$scratchDir" `
+                    '/Remove-ProvisionedAppxPackage' `
+                    "/PackageName:$pkg" |
+                    Out-Null
+
+                if ($LASTEXITCODE -eq 0) {
+
+                    $script:removedPackages.Add($pkg)
+
+                }
+                else {
+
+                    Write-Warning `
+                        "Failed to remove package '$pkg'. DISM exit code: $LASTEXITCODE"
+                }
+            }
+        }
     }
 
-    # ── STEP 10: Stripping Heavy Windows Capabilities ─────────────────────────
+    Write-Log `
+        "Provisioned packages removed successfully: $($script:removedPackages.Count)" `
+        -Color Green
+
+    # ── Step 10: Windows Capability Removal ────────────────────────────────────
     Write-Step 'Stripping unnecessary Windows capabilities'
 
     $capPrefixes = @(
@@ -687,7 +912,7 @@ try {
     )
 
     foreach (
-        $cap in (
+        $cap in @(
             Get-WindowsCapability `
                 -Path $scratchDir `
                 -ErrorAction SilentlyContinue
@@ -709,12 +934,14 @@ try {
                         -Name $cap.Name `
                         -ErrorAction SilentlyContinue |
                         Out-Null
+
+                    break
                 }
             }
         }
     }
 
-    # ── Step 11: Edge / OneDrive File Removal ─────────────────────────────────
+    # ── Step 11: Edge / OneDrive File Removal ──────────────────────────────────
     Write-Step 'Removing optional system components'
 
     if ($removeEdge) {
@@ -727,11 +954,14 @@ try {
             )
         ) {
 
-            Remove-Item `
-                -Path $p `
-                -Recurse `
-                -Force `
-                -ErrorAction SilentlyContinue
+            if (Test-Path $p) {
+
+                Remove-Item `
+                    -Path $p `
+                    -Recurse `
+                    -Force `
+                    -ErrorAction SilentlyContinue
+            }
         }
 
         $webview =
@@ -786,35 +1016,28 @@ try {
         }
     }
 
-    # ── Step 12: Offline Registry Tweaks ───────────────────────────────────────
+    # ── Step 12: Offline Registry Tweaks ────────────────────────────────────────
     Write-Step 'Applying privacy and system performance tweaks'
 
-    & reg.exe load `
-        HKLM\zCOMPONENTS `
-        "$scratchDir\Windows\System32\config\COMPONENTS" |
-        Out-Null
+    Load-RegistryHive `
+        -HiveName 'zCOMPONENTS' `
+        -HiveFile "$scratchDir\Windows\System32\config\COMPONENTS"
 
-    & reg.exe load `
-        HKLM\zDEFAULT `
-        "$scratchDir\Windows\System32\config\default" |
-        Out-Null
+    Load-RegistryHive `
+        -HiveName 'zDEFAULT' `
+        -HiveFile "$scratchDir\Windows\System32\config\default"
 
-    & reg.exe load `
-        HKLM\zNTUSER `
-        "$scratchDir\Users\Default\ntuser.dat" |
-        Out-Null
+    Load-RegistryHive `
+        -HiveName 'zNTUSER' `
+        -HiveFile "$scratchDir\Users\Default\ntuser.dat"
 
-    & reg.exe load `
-        HKLM\zSOFTWARE `
-        "$scratchDir\Windows\System32\config\SOFTWARE" |
-        Out-Null
+    Load-RegistryHive `
+        -HiveName 'zSOFTWARE' `
+        -HiveFile "$scratchDir\Windows\System32\config\SOFTWARE"
 
-    & reg.exe load `
-        HKLM\zSYSTEM `
-        "$scratchDir\Windows\System32\config\SYSTEM" |
-        Out-Null
-
-    $script:hivesLoaded = $true
+    Load-RegistryHive `
+        -HiveName 'zSYSTEM' `
+        -HiveFile "$scratchDir\Windows\System32\config\SYSTEM"
 
     foreach ($hive in 'zDEFAULT','zNTUSER') {
 
@@ -968,9 +1191,7 @@ try {
 
     Unload-AllHives
 
-    $script:hivesLoaded = $false
-
-    # ── Step 13: Scheduled Task Removal ───────────────────────────────────────
+    # ── Step 13: Scheduled Task Removal ────────────────────────────────────────
     Write-Step 'Removing diagnostic scheduled tasks'
 
     $tasks =
@@ -1007,6 +1228,11 @@ try {
         /ResetBase |
         Out-Null
 
+    if ($LASTEXITCODE -ne 0) {
+        throw `
+            "DISM component cleanup failed with exit code $LASTEXITCODE."
+    }
+
     Dismount-WindowsImage `
         -Path $scratchDir `
         -Save `
@@ -1014,14 +1240,12 @@ try {
 
     $script:installWimMounted = $false
 
-    # ── Step 15: Boot Environment Patching ────────────────────────────────────
+    # ── Step 15: Boot Environment Patching ─────────────────────────────────────
     Write-Step 'Selecting and patching boot environment (boot.wim)'
 
-    $bootWimPath =
-        Join-Path $workspaceDir 'sources\boot.wim'
-
     if (-not (Test-Path $bootWimPath)) {
-        throw "Cannot find boot.wim at: $bootWimPath"
+        throw `
+            "Cannot find boot.wim at: $bootWimPath"
     }
 
     & takeown.exe `
@@ -1038,12 +1262,16 @@ try {
     Set-ItemProperty `
         -Path $bootWimPath `
         -Name IsReadOnly `
-        -Value $false
+        -Value $false `
+        -ErrorAction SilentlyContinue
 
-    Dismount-AllStaleMounts
+    Dismount-ScratchMount
 
     # IMPORTANT:
     # Never assume boot.wim is index 2.
+    #
+    # The script examines the actual indexes in boot.wim.
+    # If there is only one index, it is selected automatically.
     $bootIndex =
         Select-ImageIndex `
             -ImagePath $bootWimPath `
@@ -1057,10 +1285,12 @@ try {
 
     $script:bootWimMounted = $true
 
-    & reg.exe load `
-        HKLM\zSYSTEM `
-        "$scratchDir\Windows\System32\config\SYSTEM" |
-        Out-Null
+    $bootSystemHive =
+        "$scratchDir\Windows\System32\config\SYSTEM"
+
+    Load-RegistryHive `
+        -HiveName 'zSYSTEM' `
+        -HiveFile $bootSystemHive
 
     $bootLabConfig =
         'HKLM\zSYSTEM\Setup\LabConfig'
@@ -1090,6 +1320,11 @@ try {
 
     & reg.exe unload HKLM\zSYSTEM | Out-Null
 
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning `
+            "Failed to unload boot SYSTEM hive. Exit code: $LASTEXITCODE"
+    }
+
     Dismount-WindowsImage `
         -Path $scratchDir `
         -Save `
@@ -1097,24 +1332,28 @@ try {
 
     $script:bootWimMounted = $false
 
-    # ── Step 16: Export to Compact ESD ────────────────────────────────────────
+    # ── Step 16: Export to Compact ESD ─────────────────────────────────────────
     Write-Step 'Exporting to highly compressed solid ESD format'
 
     $finalEsd =
-        Join-Path $workspaceDir 'sources\install.esd'
+        Join-Path `
+            $workspaceDir `
+            'sources\install.esd'
 
-    # Read the exported WIM dynamically instead of assuming index 1.
+    # Read the target WIM dynamically instead of assuming index 1.
     $finalSourceImages =
-        @(Get-WindowsImage -ImagePath $targetWim -ErrorAction Stop)
+        @(Get-WindowsImage `
+            -ImagePath $targetWim `
+            -ErrorAction Stop)
 
     if ($finalSourceImages.Count -eq 0) {
-        throw "No images found in target WIM before ESD export."
+        throw `
+            'No images found in target WIM before ESD export.'
     }
 
     if ($finalSourceImages.Count -ne 1) {
         throw `
-            "Expected exactly one image in target WIM before ESD export, " +
-            "found $($finalSourceImages.Count)."
+            "Expected exactly one image in target WIM before ESD export, found $($finalSourceImages.Count)."
     }
 
     $finalSourceIndex =
@@ -1133,11 +1372,13 @@ try {
         Out-Null
 
     if ($LASTEXITCODE -ne 0) {
-        throw "DISM ESD export failed with exit code $LASTEXITCODE."
+        throw `
+            "DISM ESD export failed with exit code $LASTEXITCODE."
     }
 
     if (-not (Test-Path $finalEsd)) {
-        throw "DISM reported success, but the final install.esd was not created."
+        throw `
+            'DISM reported success, but the final install.esd was not created.'
     }
 
     Remove-Item `
@@ -1147,16 +1388,18 @@ try {
 
     # Verify final ESD and get its real index.
     $finalImages =
-        @(Get-WindowsImage -ImagePath $finalEsd -ErrorAction Stop)
+        @(Get-WindowsImage `
+            -ImagePath $finalEsd `
+            -ErrorAction Stop)
 
     if ($finalImages.Count -eq 0) {
-        throw "No image was found in the final install.esd."
+        throw `
+            'No image was found in the final install.esd.'
     }
 
     if ($finalImages.Count -ne 1) {
         throw `
-            "Expected exactly one image in final install.esd, " +
-            "found $($finalImages.Count)."
+            "Expected exactly one image in final install.esd, found $($finalImages.Count)."
     }
 
     $finalInstallIndex =
@@ -1177,7 +1420,8 @@ try {
     Copy-Item `
         -Path $autounattendPath `
         -Destination (Join-Path $workspaceDir 'autounattend.xml') `
-        -Force
+        -Force `
+        -ErrorAction Stop
 
     Write-Log `
         'Fixed OOBE configuration injected into ISO root.' `
@@ -1192,7 +1436,9 @@ try {
     if (Test-Path $ADKPath) {
 
         $OSCDIMG =
-            Join-Path $ADKPath 'oscdimg.exe'
+            Join-Path `
+                $ADKPath `
+                'oscdimg.exe'
     }
     else {
 
@@ -1208,22 +1454,46 @@ try {
                 -ErrorAction Stop
         }
 
-        $OSCDIMG = $localOSCDIMGPath
+        $OSCDIMG =
+            $localOSCDIMGPath
     }
 
     if (-not (Test-Path $OSCDIMG)) {
-        throw "oscdimg.exe could not be found."
+        throw `
+            'oscdimg.exe could not be found.'
+    }
+
+    $bootFile =
+        Join-Path `
+            $workspaceDir `
+            'boot\etfsboot.com'
+
+    $efiFile =
+        Join-Path `
+            $workspaceDir `
+            'efi\microsoft\boot\efisys.bin'
+
+    if (-not (Test-Path $bootFile)) {
+        throw `
+            "BIOS boot file was not found: $bootFile"
+    }
+
+    if (-not (Test-Path $efiFile)) {
+        throw `
+            "UEFI boot file was not found: $efiFile"
     }
 
     $timestamp =
         Get-Date -Format 'yyyyMMdd-HHmm'
 
     $isoPath =
-        Join-Path $ScratchDisk "Tiny10_$timestamp.iso"
+        Join-Path `
+            $ScratchDisk `
+            "Tiny10_$timestamp.iso"
 
     $bootArgs =
-        "2#p0,e,b`"$workspaceDir\boot\etfsboot.com`"#" +
-        "pEF,e,b`"$workspaceDir\efi\microsoft\boot\efisys.bin`""
+        "2#p0,e,b`"$bootFile`"#" +
+        "pEF,e,b`"$efiFile`""
 
     & "$OSCDIMG" `
         '-m' `
@@ -1235,11 +1505,13 @@ try {
         "$isoPath"
 
     if ($LASTEXITCODE -ne 0) {
-        throw "oscdimg compilation failed with exit code $LASTEXITCODE."
+        throw `
+            "oscdimg compilation failed with exit code $LASTEXITCODE."
     }
 
     if (-not (Test-Path $isoPath)) {
-        throw "oscdimg completed without creating the final ISO."
+        throw `
+            'oscdimg completed without creating the final ISO.'
     }
 
     $script:buildSuccess = $true
@@ -1251,13 +1523,12 @@ try {
 
     Write-Host ''
     Write-Host '[SUCCESS] Custom lightweight ISO built.' -ForegroundColor Green
-    Write-Host "ISO:          $isoPath" -ForegroundColor Green
-    Write-Host "Edition:      $osEdition" -ForegroundColor Green
-    Write-Host "Architecture: $architecture" -ForegroundColor Green
-    Write-Host "Install index: $finalInstallIndex" -ForegroundColor Green
-    Write-Host "Boot index:    $bootIndex" -ForegroundColor Green
-    Write-Host "Packages removed: $($script:removedPackages.Count)" -ForegroundColor Green
-
+    Write-Host "ISO:               $isoPath" -ForegroundColor Green
+    Write-Host "Edition:           $osEdition" -ForegroundColor Green
+    Write-Host "Architecture:      $architecture" -ForegroundColor Green
+    Write-Host "Install index:     $finalInstallIndex" -ForegroundColor Green
+    Write-Host "Boot index:        $bootIndex" -ForegroundColor Green
+    Write-Host "Packages removed:  $($script:removedPackages.Count)" -ForegroundColor Green
 }
 catch {
 
@@ -1271,9 +1542,8 @@ catch {
 }
 finally {
 
-    if ($script:hivesLoaded) {
-        Unload-AllHives
-    }
+    # Always attempt to unload our offline registry hives.
+    Unload-AllHives
 
     if (
         $script:installWimMounted -or
@@ -1306,16 +1576,11 @@ finally {
             -ErrorAction SilentlyContinue
     }
 
-    if ($DriveLetter) {
+    # The source ISO is intentionally left mounted.
+    # This avoids trying to infer the disk image from a volume object,
+    # which is unreliable. You can eject the ISO normally after the build.
 
-        Get-Volume `
-            -DriveLetter $DriveLetter[0] |
-            Get-DiskImage `
-            -ErrorAction SilentlyContinue |
-            Dismount-DiskImage `
-            -ErrorAction SilentlyContinue |
-            Out-Null
+    if ($script:transcriptStarted) {
+        Stop-Transcript
     }
-
-    Stop-Transcript
 }
