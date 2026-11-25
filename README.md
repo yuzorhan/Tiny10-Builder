@@ -1,6 +1,6 @@
-🚧 Nano10 Builder - Under Construction
+🚧 Tiny10 Builder - Under Construction
 
-The Nano10 Builder project is currently under construction due to several issues that need to be resolved before release.
+The Tiny10 Builder project is currently under construction due to several issues that need to be resolved before release.
 
 I’m working on fixing these problems and improving the project to ensure a better experience.
 
